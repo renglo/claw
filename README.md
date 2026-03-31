@@ -12,7 +12,7 @@ The implementation lives under `package/` as the installable Python module **`cl
 | **`Loop`** | Main react loop: create turn if needed, save inbound `user_message`, iterate LLM → `interpret_model_output` → tool execution → `persist_side_effects`, optional subagents, `print_chat` for stream rows, `on_roll_event` for live roll mirrors. |
 | **`Sessions`** | Binds `entity_type`, `entity_id`, `thread` into a session id; `create_turn` / `append_event` / `get_events`; maps `SessionEvent` ↔ turn row shape (`_type`, `_out`, `_meta`). |
 | **`Gateway`** | Routes inbound `user_message` (and internal signals) into `Loop.run_turn`. |
-| **`Tools`** | Loads `ToolDefinition` from **`schd_tools`** (via `DataController`); supports **array** `input` (`[{name, hint, required}, …]`) and JSON Schema **object** `input`. |
+| **`Tools`** | Loads `ToolDefinition` from **`schd_tools`** (via `DataController`); optional **shortlist** of tool keys, or ``[\"*\"]`` for all tools; supports **array** `input` (`[{name, hint, required}, …]`) and JSON Schema **object** `input`. |
 | **`Models`** | OpenAI chat-completions adapter: `ContextBundle` → `choices` + tool calls. |
 | **`GenericAgent`** | Scheduler-facing entry: loads config, builds `Sessions`, `Loop`, `Gateway`; wires WebSocket (`on_stream`, `on_roll_event`, subagent `on_message` / `on_signal`) using `connectionId` from the payload. |
 | **`SubAgents`** | Parent/worker session bindings, messages, and typed signals (progress, completion, failure, …). |

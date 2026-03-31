@@ -274,7 +274,7 @@ class GenericAgent:
             data_controller=self.DAC,
             portfolio=context.portfolio,
             org=context.org,
-            shortlist=['search_flights', 'search_hotels'],
+            shortlist=['*'],
         )
         
         

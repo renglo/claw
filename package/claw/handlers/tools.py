@@ -215,6 +215,13 @@ class Tools:
         )
 
     @staticmethod
+    def _shortlist_includes_all(shortlist: Optional[list[str]]) -> bool:
+        """True if ``shortlist`` means “no filter” (empty/None, or contains ``\"*\"``)."""
+        if not shortlist:
+            return True
+        return any(str(x).strip() == "*" for x in shortlist)
+
+    @staticmethod
     def tool_definitions_from_items(
         items: list[dict[str, Any]],
         shortlist: Optional[list[str]] = None,
@@ -222,14 +229,16 @@ class Tools:
         """
         Many ``schd_tools`` rows → ``ToolDefinition`` list.
 
-        When ``shortlist`` is non-empty, only tools whose **key** (not display ``name``) is listed are included.
         When ``shortlist`` is empty or None, all items are included.
+        When ``shortlist`` contains ``\"*\"`` (e.g. ``[\"*\"]``), all items are included.
+        Otherwise, only tools whose **key** (not display ``name``) appears in ``shortlist`` are included.
         Rows without a **key** are skipped.
         """
+        filter_by_key = shortlist is not None and not Tools._shortlist_includes_all(shortlist)
         out: list[ToolDefinition] = []
         for doc in items:
             key = str(doc.get("key") or "").strip()
-            if shortlist and key not in shortlist:
+            if filter_by_key and key not in (shortlist or []):
                 continue
             td = Tools.tool_definition_from_doc(doc)
             if td is not None:
