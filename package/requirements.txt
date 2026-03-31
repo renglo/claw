@@ -1,0 +1,6 @@
+# Claw extension — runtime dependencies
+
+openai>=1.0.0
+
+# Renglo library (required for integration with schedulers, sessions, data)
+# Install via: pip install -e ../../../dev/renglo-lib

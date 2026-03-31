@@ -1,0 +1,53 @@
+{
+  "_id": "f47ac10b-58cc-4372-a567-0e02b2c3d404",
+  "added": "2026-03-31T12:00:00.000000",
+  "blueprint_origin": "",
+  "description": "Claw session metadata in ring storage (turns/events live in the session DynamoDB table via SessionController; this row only tracks pointers and custom meta keyed by session_id)",
+  "fields": [
+    {
+      "cardinality": "single",
+      "default": "",
+      "hint": "Canonical session key: entity_type|entity_id|thread_id (see format_session_key in Sessions)",
+      "label": "Session id",
+      "layer": "0",
+      "multilingual": false,
+      "name": "session_id",
+      "order": "1",
+      "required": true,
+      "semantic": "claw:session_id",
+      "source": "",
+      "type": "string",
+      "widget": "text"
+    },
+    {
+      "cardinality": "single",
+      "default": "_",
+      "hint": "Opaque JSON: at minimum active_turn_id after create_turn; merge patches from update_session_metadata",
+      "label": "Metadata",
+      "layer": "1",
+      "multilingual": false,
+      "name": "metadata",
+      "order": "2",
+      "required": false,
+      "semantic": "claw:session_metadata",
+      "source": "",
+      "type": "object",
+      "widget": "textarea"
+    }
+  ],
+  "handle": "irma",
+  "indexes": {
+    "path": [
+      "session_id"
+    ]
+  },
+  "irn": "irn:blueprint:irma:claw_sessions",
+  "label": "Claw session metadata",
+  "license": "CC BY",
+  "name": "claw_sessions",
+  "public": true,
+  "singleton": false,
+  "status": "final",
+  "uri": "https://renglo.com/_blueprint/irma/claw_sessions/0.0.1",
+  "version": "0.0.1"
+}
