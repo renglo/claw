@@ -31,6 +31,8 @@ Python **3.12+**. Dependencies include **`openai`**; integration with sessions, 
 
 ## Configuration
 
+Add these variables to env_config.py if they don't exist yet:
+- **`DYNAMODB_SESSION_TABLE`** - required to host the Claw sessions. Its value should be `<namespace>_session`
 - **`OPENAI_API_KEY`** — required for `Models` / `Loop` LLM calls.
 - **`WEBSOCKET_CONNECTIONS`** — API Gateway management (or local dev) URL for `WebSocketClient`; used by `GenericAgent` when `connectionId` is present on the inbound payload.
 
