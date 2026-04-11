@@ -310,7 +310,7 @@ class GenericAgent:
         
         try:
             summary = gw.handle_incoming_message(
-                agent_name='unouno',
+                agent_name='generic_agent',
                 channel='dosdos',
                 payload={'message':context.message},
                 account_id='trestres',
