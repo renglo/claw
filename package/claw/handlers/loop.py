@@ -22,58 +22,14 @@ from .class_prototypes import (
     ToolResult,
 )
 from .context import Context
-from .sessions import parse_session_key
 from .tools import Tools
 
 _logger = logging.getLogger(__name__)
 
 
-def _inject_parent_session_context(
-    params: dict[str, Any],
-    handler: str,
-    tool_init: dict[str, Any],
-    parent_session_id: str | None,
-) -> None:
-    """
-    For subagent-style tools, inject the **caller's** session coordinates under explicit
-    ``parent_*`` keys so the receiver is not given a misleading ``entity_id`` (receiver
-    coordinates differ from parent coordinates).
-
-    Injected fields:
-    - ``parent_id`` — parent's middle session segment (same as ``parent_entity_id``).
-    - ``parent_session_id``, ``parent_entity_type``, ``parent_entity_id``, ``parent_thread_id``.
-
-    The child handler should derive its own ``entity_id`` from ``parent_id`` / structured
-    parent fields. We do **not** set ``params["entity_id"]`` to the parent's id.
-
-    ``tool_init`` may set ``is_subagent`` (any handler) or rely on ``handler == "quote_agent"``.
-    """
-    if not parent_session_id:
-        return
-    is_quote = handler == "quote_agent"
-    is_subagent = bool(tool_init.get("is_subagent"))
-    if not (is_quote or is_subagent):
-        return
-    try:
-        et, eid, tid = parse_session_key(parent_session_id)
-    except ValueError:
-        _logger.warning(
-            "Subagent tool %s: invalid parent session_id %r (expected entity_type|entity_id|thread_id)",
-            handler,
-            parent_session_id,
-        )
-        return
-    params["parent_session_id"] = parent_session_id
-    params["parent_entity_type"] = et
-    params["parent_entity_id"] = eid
-    params["parent_id"] = eid
-    params["parent_thread_id"] = tid
-
-
-
 class Loop:
     """
-    ReAct-style loop: context → LLM → interpret → tools / memory / subagents → persist.
+    ReAct-style loop: context → LLM → interpret → tools / memory / optional async workers → persist.
 
     Wires optional ``SchdController.handler_call`` when ``tool_registry`` is absent.
     """
@@ -283,11 +239,7 @@ class Loop:
 
             tool_results: list[ToolResult] = []
             if decision.tool_calls:
-                tool_results = self.execute_tool_calls(
-                    decision.tool_calls,
-                    tool_definitions=all_tools,
-                    session_id=session_id,
-                )
+                tool_results = self.execute_tool_calls(decision.tool_calls, tool_definitions=all_tools)
                 summary["tool_results"].extend([asdict(tr) for tr in tool_results])
 
             self.persist_side_effects(session_id, decision, tool_results)
@@ -389,7 +341,6 @@ class Loop:
         tool_calls: list[ToolCall],
         execution_mode: Literal["sequential", "parallel"] = "sequential",
         tool_definitions: list[ToolDefinition] | None = None,
-        session_id: str | None = None,
     ) -> list[ToolResult]:
         results: list[ToolResult] = []
         if execution_mode == "parallel":
@@ -431,7 +382,7 @@ class Loop:
             if not isinstance(init, dict):
                 init = {}
             params["_init"] = init
-            _inject_parent_session_context(params, handler, init, session_id)
+            params["_handler"] = handler
 
             if self._schd and self._portfolio and self._org:
                 out = self._schd.handler_call(
