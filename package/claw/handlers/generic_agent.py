@@ -274,7 +274,7 @@ class GenericAgent:
             data_controller=self.DAC,
             portfolio=context.portfolio,
             org=context.org,
-            shortlist=['quote_agent'],
+            shortlist=['quoting_agent'],
         )
         
         

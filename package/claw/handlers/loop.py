@@ -382,7 +382,7 @@ class Loop:
             if not isinstance(init, dict):
                 init = {}
             params["_init"] = init
-            params["_handler"] = handler
+            params["_delegated"] = True
 
             if self._schd and self._portfolio and self._org:
                 out = self._schd.handler_call(
