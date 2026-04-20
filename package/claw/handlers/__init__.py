@@ -28,6 +28,8 @@ from .sessions import Sessions, format_session_key, parse_session_key
 from .subagents import SubAgents
 from .tools import Tools
 from .models import Models
+from .parallel_agent import ParallelAgent
+from .workstreams import WorkstreamRegistry, Workstreams, ensure_reference_id
 
 __all__ = [
     "Beliefs",
@@ -43,6 +45,7 @@ __all__ = [
     "Loop",
     "MemoryFact",
     "Models",
+    "ParallelAgent",
     "PromptMessage",
     "ReactDecision",
     "RuntimeCoordinator",
@@ -59,6 +62,9 @@ __all__ = [
     "ToolRegistry",
     "ToolResult",
     "WorkerSessionBinding",
+    "WorkstreamRegistry",
+    "Workstreams",
+    "ensure_reference_id",
     "format_session_key",
     "parse_session_key",
 ]

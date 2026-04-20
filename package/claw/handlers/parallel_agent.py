@@ -1,14 +1,28 @@
+"""
+Triage agent with persisted workstreams for multi-step tools (e.g. ``agent_quotes``).
+
+Execution is sequential (blocking tool calls). "Parallel" means several tasks can sit at
+different steps; each is keyed by ``reference_id`` passed to the tool alongside ``message``.
+
+Active workstreams live on the workspace document as top-level ``workstreams`` (see
+:class:`WorkstreamRegistry`). The workspace row is resolved from ``portfolio``, ``org``,
+``entity_type``, ``entity_id``, and ``thread`` (same as ``AgentUtilities.get_active_workspace``).
+
+After each tool call, :meth:`WorkstreamRegistry.after_tool_calls` updates the workstream entries
+so the next turn’s prompt (via :class:`Workstreams`) lists current state.
+"""
+
 from __future__ import annotations
 
 from .gateway import Gateway
 from .loop import Loop
 from .subagents import SubAgents
-from .context import Context
 from .sessions import Sessions
 from .beliefs import Beliefs
 from .journal import Journal
 from .tools import Tools
 from .models import Models
+from .workstreams import WorkstreamRegistry, Workstreams
 
 from renglo.data.data_controller import DataController
 from renglo.session.session_controller import SessionController
@@ -29,53 +43,22 @@ from contextvars import ContextVar
 _logger = logging.getLogger(__name__)
 
 
-
 @dataclass
 class RequestContext:
-    """
-    Attributes
-    ----------
-    connection_id : str
-        WebSocket connection ID for responding to user
-    portfolio : str
-        Portfolio ID
-    org : str
-        Organization ID
-    public_user : str
-        External user ID (for messages from outside the system)
-    entity_type : str
-        Entity type (e.g., 'noma_travels')
-    entity_id : str
-        Entity ID (e.g., trip_id)
-    thread : str
-        Thread ID
-    workspace_id : str
-        Workspace ID
-    chat_id : str
-        Chat ID
-    workspace : Dict[str, Any]
-        Workspace document with cache and state
-    message : str
-        User message text
-    """
-    connection_id: str = ''
-    portfolio: str = ''
-    org: str = ''
-    public_user: str = ''
-    entity_type: str = ''
-    entity_id: str = ''
-    thread: str = ''
-    workspace_id: str = ''
-    message: str = ''
-    
-
-# Create a context variable to store the request context
-request_context: ContextVar[RequestContext] = ContextVar('request_context', default=RequestContext())
+    connection_id: str = ""
+    portfolio: str = ""
+    org: str = ""
+    public_user: str = ""
+    entity_type: str = ""
+    entity_id: str = ""
+    thread: str = ""
+    message: str = ""
 
 
-class GenericAgent:
+request_context: ContextVar[RequestContext] = ContextVar("parallel_request_context", default=RequestContext())
 
 
+class ParallelAgent:
     def __init__(self) -> None:
         self.config = load_config()
         self.DAC = DataController(config=self.config)
@@ -92,21 +75,12 @@ class GenericAgent:
         request_context.set(context)
 
     def _send_ws(self, doc: Dict[str, Any], connection_id: Optional[str] = None) -> bool:
-        """
-        Push a chat-shaped document to the API Gateway WebSocket client, same contract as
-        AgentUtilities.print_chat: post_to_connection(connection_id, payload).
-        """
         cid = connection_id or self._get_context().connection_id
         if not cid or not self._ws.is_configured():
             return False
         return self._ws.send_message(cid, doc)
 
     def _persist_realtime_event(self, event_type: str, body: Dict[str, Any]) -> None:
-        """
-        Mirror WebSocket payloads on the active turn so reload reads the same rows from session storage.
-
-        Uses the same ``_type`` / string JSON in ``_out.content`` shape as ``_send_ws`` (via Sessions roll encoding).
-        """
         ss = self._sessions
         if ss is None:
             return
@@ -123,11 +97,6 @@ class GenericAgent:
             _logger.warning("Failed to persist realtime event %s: %s", event_type, e)
 
     def on_signal(self, signal: SubAgentSignal) -> None:
-        """
-        Structured subagent lifecycle events (progress, blocked, task_complete, failure, …).
-        Distinct from conversational text: machine-oriented ``signal_type`` + payload for UI chrome
-        (badges, toasts, stepper), not a chat bubble line.
-        """
         body = {
             "channel": "claw_signal",
             "signal_type": signal.signal_type,
@@ -147,10 +116,6 @@ class GenericAgent:
         self._send_ws(doc)
 
     def on_message(self, message: SubAgentMessage) -> None:
-        """
-        Natural-language relay between parent and worker sessions (inter-agent dialogue).
-        Use for transcript-style lines the user may optionally see; not iteration counters.
-        """
         body = {
             "channel": "claw_subagent_message",
             "message_id": message.message_id,
@@ -172,12 +137,6 @@ class GenericAgent:
         self._send_ws(doc)
 
     def on_stream(self, message: Dict[str, Any]) -> None:
-        """
-        WebSocket delivery for loop status from ``Loop.print_chat``.
-
-        The turn is updated once in ``Loop.print_chat`` (``claw_stream`` via ``save_event``); this callback
-        only mirrors the same payload to the client so we do not append the same stream twice.
-        """
         body = {"channel": "claw_stream", **message}
         doc = {
             "_type": "claw_stream",
@@ -186,15 +145,10 @@ class GenericAgent:
         self._send_ws(doc)
 
     def on_roll_event(self, row: Dict[str, Any]) -> None:
-        """
-        Push persisted roll events (``user_message``, ``assistant_message``, ``tool_call``, ``tool_result``)
-        over the WebSocket using the same document shape as ``Sessions._event_to_message`` / reload.
-        """
         self._send_ws(row)
 
-        
     def run(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        action = "run >  agent"
+        action = "run > parallel_agent"
         context = RequestContext()
 
         if isinstance(payload, str):
@@ -228,62 +182,67 @@ class GenericAgent:
             context.thread = payload["thread"]
         else:
             context.thread = "1234c"
-        if "workspace" in payload:
-            context.workspace_id = payload["workspace"]
         if "data" in payload:
             context.message = payload["data"]
-
 
         self._set_context(context)
 
         ss = Sessions(
-            session_controller = self.SSC,
-            portfolio = context.portfolio,
-            org = context.org,
-            entity_type = context.entity_type,
-            entity_id = context.entity_id,
-            thread_id = context.thread,
-            data_controller = self.DAC,
+            session_controller=self.SSC,
+            portfolio=context.portfolio,
+            org=context.org,
+            entity_type=context.entity_type,
+            entity_id=context.entity_id,
+            thread_id=context.thread,
+            data_controller=self.DAC,
         )
         self._sessions = ss
-        
+
         be = Beliefs(
-            data_controller = self.DAC,
-            portfolio = context.portfolio,
-            org= context.org
+            data_controller=self.DAC,
+            portfolio=context.portfolio,
+            org=context.org,
         )
-        
+
         jo = Journal(
-            data_controller = self.DAC,
-            portfolio = context.portfolio,
-            org= context.org,
-            entity_type = context.entity_type,
-            entity_id = context.entity_id
+            data_controller=self.DAC,
+            portfolio=context.portfolio,
+            org=context.org,
+            entity_type=context.entity_type,
+            entity_id=context.entity_id,
         )
-        
+
         sa = SubAgents(
-            parent_agent_name = 'main_agent',
-            on_signal = self.on_signal,
-            on_message = self.on_message,
+            parent_agent_name="main_agent",
+            on_signal=self.on_signal,
+            on_message=self.on_message,
         )
-        
-        cx = Context()
+
+        cx = Workstreams()
         ll = Models(config=self.config)
-        
+
         tl = Tools(
             data_controller=self.DAC,
             portfolio=context.portfolio,
             org=context.org,
-            shortlist=['agent_quotes'],
+            shortlist=["agent_quotes"],
         )
-        
-        
+
+        registry = WorkstreamRegistry(
+            self.SSC,
+            portfolio=context.portfolio,
+            org=context.org,
+            entity_type=context.entity_type,
+            entity_id=context.entity_id,
+            thread_id=context.thread,
+        )
+
         lp = Loop(
             llm=ll,
             context_engine=cx,
             sessions=ss,
             tool_registry=tl,
-            task_state_store=None,
+            task_state_store=registry,
             beliefs=be,
             journal=jo,
             subagents=sa,
@@ -296,8 +255,7 @@ class GenericAgent:
             on_roll_event=self.on_roll_event,
             debug=True,
         )
-        
-        
+
         gw = Gateway(
             loop=lp,
             subagents=sa,
@@ -305,17 +263,17 @@ class GenericAgent:
             org=context.org,
             entity_type=context.entity_type,
             entity_id=context.entity_id,
-            default_thread_id='111111'   
+            default_thread_id="111111",
         )
-        
+
         try:
             summary = gw.handle_incoming_message(
-                agent_name='generic_agent',
-                channel='dosdos',
-                payload={'message':context.message},
-                account_id='trestres',
-                peer_id='cuatrocuatro',
-                thread_id=context.thread
+                agent_name="parallel_agent",
+                channel="dosdos",
+                payload={"message": context.message},
+                account_id="trestres",
+                peer_id="cuatrocuatro",
+                thread_id=context.thread,
             )
             return {
                 "success": True,
@@ -325,4 +283,3 @@ class GenericAgent:
             }
         finally:
             self._sessions = None
-

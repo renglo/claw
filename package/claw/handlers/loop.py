@@ -23,6 +23,7 @@ from .class_prototypes import (
 )
 from .context import Context
 from .tools import Tools
+from .workstreams import forced_tool_calls_for_pending_workstream_reply
 
 _logger = logging.getLogger(__name__)
 
@@ -223,19 +224,34 @@ class Loop:
                 prompt_messages=len(bundle.messages),
                 tools=len(bundle.tools),
             )
-            
-            raw = self.call_model(bundle)
-            self._debug_log(
-                "run_turn:after_call_model",
-                n=iteration,
-                raw_keys=list(raw.keys()) if isinstance(raw, dict) else type(raw).__name__,
-                first_choice_preview=(
-                    str(raw.get("choices", [{}])[0])[:400]
-                    if isinstance(raw, dict) and raw.get("choices")
-                    else None
-                ),
-            )
-            decision = self.interpret_model_output(raw)
+
+            forced_tcs = forced_tool_calls_for_pending_workstream_reply(task_state, incoming_event)
+            if forced_tcs and iteration == 1:
+                tc0 = forced_tcs[0]
+                self._debug_log(
+                    "run_turn:forced_workstream_tool",
+                    n=iteration,
+                    tool=tc0.tool_name,
+                    reference_id=(tc0.arguments or {}).get("reference_id"),
+                )
+                decision = ReactDecision(
+                    assistant_message=None,
+                    tool_calls=forced_tcs,
+                    should_continue=True,
+                )
+            else:
+                raw = self.call_model(bundle)
+                self._debug_log(
+                    "run_turn:after_call_model",
+                    n=iteration,
+                    raw_keys=list(raw.keys()) if isinstance(raw, dict) else type(raw).__name__,
+                    first_choice_preview=(
+                        str(raw.get("choices", [{}])[0])[:400]
+                        if isinstance(raw, dict) and raw.get("choices")
+                        else None
+                    ),
+                )
+                decision = self.interpret_model_output(raw)
 
             tool_results: list[ToolResult] = []
             if decision.tool_calls:
@@ -273,6 +289,9 @@ class Loop:
             if not self.should_continue_iteration(decision, tool_results, task_state):
                 summary["terminated"] = True
                 break
+
+            if self._task_store:
+                task_state = self._task_store.get_task_state(session_id)
 
         if last_assistant:
             summary["emitted_message"] = last_assistant
@@ -393,13 +412,23 @@ class Loop:
                     params,
                 )
                 ok = bool(out.get("success"))
+                err_raw = out.get("output") if not ok else None
+                if err_raw is not None and not isinstance(err_raw, str):
+                    try:
+                        err_str = json.dumps(err_raw, default=str)
+                        if len(err_str) > 2400:
+                            err_str = err_str[:2399] + '…'
+                    except Exception:
+                        err_str = str(err_raw)[:2400]
+                else:
+                    err_str = str(err_raw) if err_raw else (None if ok else "handler failed")
                 results.append(
                     ToolResult(
                         tool_name=tc.tool_name,
                         call_id=tc.call_id,
                         success=ok,
                         result=out.get("output"),
-                        error=None if ok else str(out.get("output")),
+                        error=None if ok else err_str,
                     )
                 )
                 continue
@@ -476,6 +505,10 @@ class Loop:
 
         if decision.task_state_patch and self._task_store:
             self._task_store.patch_task_state(session_id, decision.task_state_patch)
+
+        hook = getattr(self._task_store, "after_tool_calls", None) if self._task_store else None
+        if callable(hook):
+            hook(session_id, decision.tool_calls, tool_results)
 
     def should_continue_iteration(
         self,

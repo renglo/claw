@@ -58,7 +58,7 @@ JSON blueprints under **`blueprints/`** are used with the installer / data layer
 
 ## Related code
 
-- **Renglo** (`dev/renglo-lib`): `SessionController`, `ChatController`, `SchdController`, `DataController`.
+- **Renglo** (`dev/renglo-lib`): `SessionController` (sessions, workspaces under `irn:session:…`), `SchdController`, `DataController`.
 - **UI** (e.g. triage): consumes session turns and WebSocket roll payloads; **`on_roll_event`** sends the same shape as stored rows for reload parity.
 
 ## License
