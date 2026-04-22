@@ -141,10 +141,14 @@ class ContextBundle:
 
     Contains the final prompt messages and the tool definitions that should
     be exposed to the model for a given turn.
+
+    ``response_format`` is optional; when set (e.g. ``{"type": "json_object"}``), adapters
+    that support it pass it through to the provider for structured completions.
     """
     messages: list[PromptMessage]
     tools: list[ToolDefinition]
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    response_format: Optional[dict[str, Any]] = None
 
 
 @dataclass

@@ -225,7 +225,9 @@ class Loop:
                 tools=len(bundle.tools),
             )
 
-            forced_tcs = forced_tool_calls_for_pending_workstream_reply(task_state, incoming_event)
+            forced_tcs = forced_tool_calls_for_pending_workstream_reply(
+                task_state, incoming_event, llm=self._llm
+            )
             if forced_tcs and iteration == 1:
                 tc0 = forced_tcs[0]
                 self._debug_log(

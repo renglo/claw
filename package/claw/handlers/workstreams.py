@@ -25,6 +25,7 @@ from .class_prototypes import (
     ContextBundle,
     IncomingEvent,
     JournalEntry,
+    LLMAdapter,
     MemoryFact,
     PromptMessage,
     SessionEvent,
@@ -47,18 +48,7 @@ def ensure_reference_id() -> str:
     return str(uuid.uuid4())
 
 
-def forced_tool_calls_for_pending_workstream_reply(
-    task_state: Optional[TaskState],
-    incoming_event: IncomingEvent,
-) -> list[ToolCall]:
-    """
-    When exactly one workstream is ``waiting_for_user``, the model must not answer directly;
-    route this user turn to that handler (e.g. ``agent_quotes``) with ``reference_id`` + ``message``.
-
-    Used by :class:`Loop` on iteration 1 only so follow-up iterations can summarize after tools run.
-    """
-    if incoming_event.event_type != "user_message":
-        return []
+def _collect_waiting_workstreams(task_state: Optional[TaskState]) -> list[tuple[str, dict[str, Any]]]:
     if not task_state or not task_state.references:
         return []
     aw = task_state.references.get("active_workstreams")
@@ -68,21 +58,160 @@ def forced_tool_calls_for_pending_workstream_reply(
     for rid, entry in aw.items():
         if isinstance(entry, dict) and entry.get("status") == "waiting_for_user":
             waiting.append((str(rid), entry))
-    if len(waiting) != 1:
-        return []
-    ref_id, entry = waiting[0]
+    return waiting
+
+
+def _parse_forced_workstream_reference_id(
+    raw: dict[str, Any],
+    valid_ids: set[str],
+) -> Optional[str]:
+    """
+    Parse selector LLM output. Returns a ``reference_id`` to force-route into, or ``None`` when
+    the model chose ``new_intent``, output was invalid, or parsing failed (caller skips forced tool).
+    """
+    try:
+        msg = (raw.get("choices") or [{}])[0].get("message") or {}
+        content = str(msg.get("content") or "").strip()
+        if not content or content.startswith("LLM error:"):
+            return None
+        data = json.loads(content)
+        if not isinstance(data, dict):
+            return None
+
+        action = str(data.get("action") or "").strip().lower()
+        rid_raw = data.get("reference_id")
+
+        if action == "new_intent":
+            _logger.debug("workstreams: selector LLM chose new_intent (no forced tool)")
+            return None
+
+        if action == "continue":
+            if rid_raw is None:
+                return None
+            rid = str(rid_raw).strip()
+            if rid not in valid_ids:
+                _logger.warning(
+                    "workstreams: selector LLM continue with unknown reference_id %r; skip forced route",
+                    rid,
+                )
+                return None
+            return rid
+
+        # Legacy shape: {"reference_id": "..."} without action (older prompts / models)
+        if not action and rid_raw is not None:
+            rid = str(rid_raw).strip()
+            return rid if rid in valid_ids else None
+
+        return None
+    except Exception:
+        return None
+
+
+def _forced_tool_call_for_reference(
+    by_id: dict[str, dict[str, Any]],
+    chosen: str,
+    user_text: str,
+) -> list[ToolCall]:
+    entry = by_id[chosen]
     tool = (entry.get("tool") or entry.get("handler") or "").strip()
     if not tool:
         return []
-    payload = incoming_event.payload or {}
-    user_text = str(payload.get("text") or payload.get("message") or "")
     return [
         ToolCall(
             tool_name=tool,
-            arguments={"reference_id": ref_id, "message": user_text},
+            arguments={"reference_id": chosen, "message": user_text},
             call_id=f"forced-workstream-{uuid.uuid4()}",
         )
     ]
+
+
+def forced_tool_calls_for_pending_workstream_reply(
+    task_state: Optional[TaskState],
+    incoming_event: IncomingEvent,
+    llm: Optional[LLMAdapter] = None,
+) -> list[ToolCall]:
+    """
+    When one or more workstreams are ``waiting_for_user``, optionally route the user turn to one
+    of those handlers with ``reference_id`` + ``message`` (iteration 1 of :class:`Loop`).
+
+    - **No LLM, single waiting stream:** deterministic forced tool call (backward compatible).
+    - **No LLM, multiple waiting:** no forced route (log warning); triage decides.
+    - **With LLM:** small structured call classifies the user message. ``action: continue`` plus a
+      candidate ``reference_id`` forces that tool. ``action: new_intent`` returns no forced call so
+      triage can start a **parallel** flow (new ``reference_id``) while other workstreams stay
+      waiting — e.g. checking distances or a calendar mid trip-planning.
+
+    If the LLM returns an invalid ``reference_id`` or parsing fails, returns ``[]``.
+    """
+    if incoming_event.event_type != "user_message":
+        return []
+    waiting = _collect_waiting_workstreams(task_state)
+    if not waiting:
+        return []
+
+    payload = incoming_event.payload or {}
+    user_text = str(payload.get("text") or payload.get("message") or "")
+
+    by_id = {rid: entry for rid, entry in waiting}
+    valid_ids = set(by_id.keys())
+
+    if llm is None:
+        if len(waiting) == 1:
+            ref_id = next(iter(valid_ids))
+            return _forced_tool_call_for_reference(by_id, ref_id, user_text)
+        _logger.warning(
+            "workstreams: %d waiting_for_user workstreams but no llm for selection; skip forced route",
+            len(waiting),
+        )
+        return []
+
+    candidates = []
+    for ref_id, entry in waiting:
+        candidates.append(
+            {
+                "reference_id": ref_id,
+                "tool": (entry.get("tool") or entry.get("handler") or "").strip(),
+                "label": entry.get("label"),
+                "last_message_preview": entry.get("last_message_preview"),
+                "last_result_preview": entry.get("last_result_preview"),
+            }
+        )
+
+    system = (
+        "You route the user's latest message when one or more multi-step workstreams are waiting "
+        "for them.\n"
+        '- If they are continuing, answering, or clarifying **within** one of those flows, '
+        'respond with {"action": "continue", "reference_id": "<id>"} using the exact id from '
+        "candidates.\n"
+        "- If they are asking for something **separate** — a parallel task, unrelated tool, new "
+        "topic, side question (e.g. distances between places, calendar dates, a different errand) "
+        'while a trip or quote flow is still open — respond with {"action": "new_intent", '
+        '"reference_id": null} so triage can start or route a new flow without hijacking the '
+        "existing workstream.\n"
+        "Use labels and last_message_preview / last_result_preview for context. "
+        'Reply with JSON only; keys are always "action" and "reference_id".'
+    )
+    user_block = json.dumps({"user_message": user_text, "candidates": candidates}, default=str)
+
+    try:
+        bundle = ContextBundle(
+            messages=[
+                PromptMessage(role="system", content=system),
+                PromptMessage(role="user", content=user_block),
+            ],
+            tools=[],
+            response_format={"type": "json_object"},
+        )
+        raw = llm.complete(bundle)
+        if not isinstance(raw, dict):
+            return []
+        chosen = _parse_forced_workstream_reference_id(raw, valid_ids)
+        if not chosen:
+            return []
+        return _forced_tool_call_for_reference(by_id, chosen, user_text)
+    except Exception as e:
+        _logger.warning("workstreams: selector LLM failed: %s", e)
+        return []
 
 
 def _is_workstream_entry(d: Any) -> bool:
@@ -471,8 +600,10 @@ class Workstreams(Context):
         lines = [
             "Active workstreams (multi-step flows). Pick which reference_id applies this turn; "
             "call the listed handler/tool with that reference_id and the user's message.",
-            "If any workstream has status waiting_for_user, you MUST call that handler with the "
-            "same reference_id and the user's latest message before answering on your own.",
+            "If the user is continuing a flow that is waiting_for_user, prefer calling that handler "
+            "with the same reference_id and their latest message.",
+            "If the user is starting a separate or parallel task (unrelated question, new tool path), "
+            "call the appropriate handler with a new reference_id instead of reusing a waiting one.",
             f"active_workstreams: {json.dumps(aw, default=str)[:12000]}",
             f"pending_obligations: {json.dumps(po, default=str)[:8000]}",
         ]

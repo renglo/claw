@@ -362,6 +362,7 @@ class Sessions:
             self._entity_type,
             self._entity_id,
             self._thread_id,
+            False,
         )
         if not res.get("success"):
             return []

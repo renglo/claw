@@ -78,6 +78,8 @@ class Models:
                 if oa_tools:
                     params["tools"] = oa_tools
                     params["tool_choice"] = "auto"
+                elif bundle.response_format:
+                    params["response_format"] = bundle.response_format
                 response = self.AI_2.chat.completions.create(**params)
 
             msg = response.choices[0].message
