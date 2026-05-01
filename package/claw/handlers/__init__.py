@@ -29,13 +29,22 @@ from .subagents import SubAgents
 from .tools import Tools
 from .models import Models
 from .parallel_agent import ParallelAgent
-from .workstreams import WorkstreamRegistry, Workstreams, ensure_reference_id
+from .workstreams import (
+    ForcedWorkstreamRouting,
+    WorkstreamRegistry,
+    Workstreams,
+    ensure_reference_id,
+    forced_tool_calls_for_pending_workstream_reply,
+    generate_triage_workstream_hex_id,
+    resolve_forced_workstream_routing,
+)
 
 __all__ = [
     "Beliefs",
     "Compaction",
     "CompactionResult",
     "Context",
+    "ForcedWorkstreamRouting",
     "ContextBundle",
     "Gateway",
     "IncomingEvent",
@@ -65,6 +74,9 @@ __all__ = [
     "WorkstreamRegistry",
     "Workstreams",
     "ensure_reference_id",
+    "forced_tool_calls_for_pending_workstream_reply",
+    "generate_triage_workstream_hex_id",
+    "resolve_forced_workstream_routing",
     "format_session_key",
     "parse_session_key",
 ]

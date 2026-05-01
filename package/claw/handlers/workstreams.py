@@ -15,10 +15,13 @@ This module is the **single integration point**:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import re
 import uuid
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from .class_prototypes import (
@@ -41,6 +44,13 @@ _logger = logging.getLogger(__name__)
 
 # Top-level workspace field (see SessionController.update_workspace ``workstreams`` key)
 WORKSPACE_WORKSTREAMS_KEY = "workstreams"
+# Triage-owned default / active workstream key (hex); stamped onto tool calls server-side.
+WORKSPACE_TRIAGE_FOCAL_KEY = "triage_focal_workstream_id"
+
+
+def generate_triage_workstream_hex_id() -> str:
+    """Opaque hex id for a triage workstream (32 nybbles, no dashes)."""
+    return uuid.uuid4().hex
 
 
 def ensure_reference_id() -> str:
@@ -61,50 +71,150 @@ def _collect_waiting_workstreams(task_state: Optional[TaskState]) -> list[tuple[
     return waiting
 
 
-def _parse_forced_workstream_reference_id(
+def _waiting_reference_ids_from_items(items: dict[str, Any]) -> set[str]:
+    return {
+        str(k)
+        for k, v in items.items()
+        if isinstance(v, dict) and v.get("status") == "waiting_for_user"
+    }
+
+
+def _tool_call_raw_reference_id(args: dict[str, Any]) -> str:
+    r = args.get("reference_id")
+    return str(r).strip() if r is not None else ""
+
+
+def _set_tool_reference_arguments(args: dict[str, Any], reference_id: str) -> None:
+    args["reference_id"] = reference_id
+
+
+def _normalize_fingerprint_token(text: Any) -> str:
+    s = str(text or "").strip().lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _legacy_trip_fingerprint_from_request(tr: dict[str, Any]) -> str:
+    """Backward-compatible trip dedupe key (pipe-separated). Prefer ``fingerprint_payload``."""
+    origin = _normalize_fingerprint_token(tr.get("origin") or tr.get("from"))
+    destination = _normalize_fingerprint_token(tr.get("destination") or tr.get("to"))
+    date = _normalize_fingerprint_token(tr.get("start_date") or tr.get("departure_date"))
+    nights = str(tr.get("nights") or "").strip()
+    adults = str(tr.get("adults") or "").strip()
+    if not any((origin, destination, date, nights, adults)):
+        return ""
+    return "|".join((origin, destination, date, nights, adults))
+
+
+def _canonicalize_for_fingerprint(val: Any) -> Any:
+    if isinstance(val, dict):
+        return {str(k): _canonicalize_for_fingerprint(v) for k, v in sorted(val.items(), key=lambda kv: str(kv[0]))}
+    if isinstance(val, list):
+        return [_canonicalize_for_fingerprint(x) for x in val]
+    if isinstance(val, str):
+        return _normalize_fingerprint_token(val)
+    return val
+
+
+def _hash_intent_fingerprint(schema: str, payload: dict[str, Any]) -> str:
+    blob = json.dumps(
+        {"schema": schema, "payload": _canonicalize_for_fingerprint(payload)},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _intent_fingerprint_from_tool_args(args: dict[str, Any]) -> str:
+    """
+    Domain-agnostic stream dedupe key.
+
+    Precedence:
+    1. ``intent_fingerprint`` if caller supplies it
+    2. ``fingerprint_schema`` + ``fingerprint_payload`` (hashed)
+    3. legacy ``trip_fingerprint`` / ``trip_request``
+    """
+    explicit = args.get("intent_fingerprint")
+    if explicit is not None:
+        s = str(explicit).strip().lower()
+        if s:
+            return s
+    schema_raw = args.get("fingerprint_schema")
+    payload = args.get("fingerprint_payload")
+    if isinstance(payload, dict) and payload:
+        schema = str(schema_raw or "generic.v1").strip() or "generic.v1"
+        return _hash_intent_fingerprint(schema, payload)
+    legacy_trip = args.get("trip_fingerprint")
+    if legacy_trip is not None:
+        s = str(legacy_trip).strip().lower()
+        if s:
+            return s
+    tr = args.get("trip_request")
+    if isinstance(tr, dict):
+        return _legacy_trip_fingerprint_from_request(tr)
+    return ""
+
+
+def _workstream_intent_fingerprint_key(entry: dict[str, Any]) -> str:
+    v = str(entry.get("intent_fingerprint") or entry.get("trip_fingerprint") or "").strip().lower()
+    return v
+
+
+def _parse_forced_workstream_selector_output(
     raw: dict[str, Any],
     valid_ids: set[str],
-) -> Optional[str]:
+) -> tuple[Optional[str], bool]:
     """
-    Parse selector LLM output. Returns a ``reference_id`` to force-route into, or ``None`` when
-    the model chose ``new_intent``, output was invalid, or parsing failed (caller skips forced tool).
+    Parse waiting-workstream selector LLM output.
+
+    Returns ``(reference_id_for_forced_tool, bump_focal)`` where ``bump_focal`` is True only when
+    the model explicitly chose ``new_intent`` (start a new triage workstream id).
     """
     try:
         msg = (raw.get("choices") or [{}])[0].get("message") or {}
         content = str(msg.get("content") or "").strip()
         if not content or content.startswith("LLM error:"):
-            return None
+            return None, False
         data = json.loads(content)
         if not isinstance(data, dict):
-            return None
+            return None, False
 
         action = str(data.get("action") or "").strip().lower()
         rid_raw = data.get("reference_id")
 
         if action == "new_intent":
             _logger.debug("workstreams: selector LLM chose new_intent (no forced tool)")
-            return None
+            return None, True
 
         if action == "continue":
             if rid_raw is None:
-                return None
+                return None, False
             rid = str(rid_raw).strip()
             if rid not in valid_ids:
                 _logger.warning(
                     "workstreams: selector LLM continue with unknown reference_id %r; skip forced route",
                     rid,
                 )
-                return None
-            return rid
+                return None, False
+            return rid, False
 
         # Legacy shape: {"reference_id": "..."} without action (older prompts / models)
         if not action and rid_raw is not None:
             rid = str(rid_raw).strip()
-            return rid if rid in valid_ids else None
+            return (rid if rid in valid_ids else None), False
 
-        return None
+        return None, False
     except Exception:
-        return None
+        return None, False
+
+
+def _parse_forced_workstream_reference_id(
+    raw: dict[str, Any],
+    valid_ids: set[str],
+) -> Optional[str]:
+    chosen, _ = _parse_forced_workstream_selector_output(raw, valid_ids)
+    return chosen
 
 
 def _forced_tool_call_for_reference(
@@ -125,45 +235,47 @@ def _forced_tool_call_for_reference(
     ]
 
 
-def forced_tool_calls_for_pending_workstream_reply(
+@dataclass
+class ForcedWorkstreamRouting:
+    """Result of iteration-1 routing when workstreams are waiting for the user."""
+
+    tool_calls: list[ToolCall]
+    bump_focal_workstream: bool = False
+
+
+def resolve_forced_workstream_routing(
     task_state: Optional[TaskState],
     incoming_event: IncomingEvent,
     llm: Optional[LLMAdapter] = None,
-) -> list[ToolCall]:
+) -> ForcedWorkstreamRouting:
     """
-    When one or more workstreams are ``waiting_for_user``, optionally route the user turn to one
-    of those handlers with ``reference_id`` + ``message`` (iteration 1 of :class:`Loop`).
+    When one or more workstreams are ``waiting_for_user``, route the user turn via a small LLM
+    call: ``action: continue`` plus ``reference_id`` forces that tool; ``action: new_intent`` sets
+    ``bump_focal_workstream`` so triage allocates a new focal id before the main model runs.
 
-    - **No LLM, single waiting stream:** deterministic forced tool call (backward compatible).
-    - **No LLM, multiple waiting:** no forced route (log warning); triage decides.
-    - **With LLM:** small structured call classifies the user message. ``action: continue`` plus a
-      candidate ``reference_id`` forces that tool. ``action: new_intent`` returns no forced call so
-      triage can start a **parallel** flow (new ``reference_id``) while other workstreams stay
-      waiting — e.g. checking distances or a calendar mid trip-planning.
+    If any workstream is waiting, an ``LLMAdapter`` **must** be provided; otherwise this raises
+    ``RuntimeError`` (no silent fallback).
 
-    If the LLM returns an invalid ``reference_id`` or parsing fails, returns ``[]``.
+    If the LLM returns an invalid ``reference_id`` or parsing fails, returns empty tool calls and
+    no bump.
     """
     if incoming_event.event_type != "user_message":
-        return []
+        return ForcedWorkstreamRouting([])
     waiting = _collect_waiting_workstreams(task_state)
     if not waiting:
-        return []
+        return ForcedWorkstreamRouting([])
+
+    if llm is None:
+        raise RuntimeError(
+            "workstream routing requires an LLM when one or more workstreams are waiting_for_user "
+            "(configure Loop with a non-null llm adapter)"
+        )
 
     payload = incoming_event.payload or {}
     user_text = str(payload.get("text") or payload.get("message") or "")
 
     by_id = {rid: entry for rid, entry in waiting}
     valid_ids = set(by_id.keys())
-
-    if llm is None:
-        if len(waiting) == 1:
-            ref_id = next(iter(valid_ids))
-            return _forced_tool_call_for_reference(by_id, ref_id, user_text)
-        _logger.warning(
-            "workstreams: %d waiting_for_user workstreams but no llm for selection; skip forced route",
-            len(waiting),
-        )
-        return []
 
     candidates = []
     for ref_id, entry in waiting:
@@ -204,14 +316,25 @@ def forced_tool_calls_for_pending_workstream_reply(
         )
         raw = llm.complete(bundle)
         if not isinstance(raw, dict):
-            return []
-        chosen = _parse_forced_workstream_reference_id(raw, valid_ids)
-        if not chosen:
-            return []
-        return _forced_tool_call_for_reference(by_id, chosen, user_text)
+            return ForcedWorkstreamRouting([])
+        chosen, bump = _parse_forced_workstream_selector_output(raw, valid_ids)
+        if bump:
+            return ForcedWorkstreamRouting([], bump_focal_workstream=True)
+        if chosen:
+            return ForcedWorkstreamRouting(_forced_tool_call_for_reference(by_id, chosen, user_text))
+        return ForcedWorkstreamRouting([])
     except Exception as e:
         _logger.warning("workstreams: selector LLM failed: %s", e)
-        return []
+        return ForcedWorkstreamRouting([])
+
+
+def forced_tool_calls_for_pending_workstream_reply(
+    task_state: Optional[TaskState],
+    incoming_event: IncomingEvent,
+    llm: Optional[LLMAdapter] = None,
+) -> list[ToolCall]:
+    """Backward-compatible wrapper: returns only the forced tool calls list."""
+    return resolve_forced_workstream_routing(task_state, incoming_event, llm=llm).tool_calls
 
 
 def _is_workstream_entry(d: Any) -> bool:
@@ -259,6 +382,31 @@ def _tool_result_requests_workstream_release(val: Any) -> bool:
     return False
 
 
+def _extract_subagent_protocol(result: Any) -> Optional[dict[str, Any]]:
+    if isinstance(result, dict):
+        proto = result.get("subagent_protocol")
+        if isinstance(proto, dict):
+            return proto
+        msgs = result.get("messages")
+        if isinstance(msgs, list):
+            for row in msgs:
+                if (
+                    isinstance(row, dict)
+                    and row.get("_interface") == "subagent_protocol"
+                    and isinstance((row.get("_out") or {}).get("content"), dict)
+                ):
+                    return (row.get("_out") or {}).get("content")
+    if isinstance(result, list):
+        for row in result:
+            if (
+                isinstance(row, dict)
+                and row.get("_interface") == "subagent_protocol"
+                and isinstance((row.get("_out") or {}).get("content"), dict)
+            ):
+                return (row.get("_out") or {}).get("content")
+    return None
+
+
 def _preview(val: Any, max_len: int) -> str:
     try:
         s = val if isinstance(val, str) else json.dumps(val, default=str)
@@ -268,6 +416,43 @@ def _preview(val: Any, max_len: int) -> str:
     if len(s) > max_len:
         return s[: max_len - 1] + "…"
     return s
+
+
+def _coerce_non_empty_trip_id(val: Any) -> Optional[str]:
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s or len(s) < 8:
+        return None
+    low = s.lower()
+    if low.startswith("error") or "error in " in low[:80]:
+        return None
+    return s
+
+
+def _extract_trip_id_from_tool_result(result: Any) -> Optional[str]:
+    """
+    Best-effort ``trip_id`` from scheduler canonical tool output.
+
+    Covers NOMA-style handlers that return a string (e.g. ``check_for_trip_id``), a dict with
+    top-level ``trip_id``, or nested ``output.trip_id`` (legacy / wrapped shapes).
+    """
+    if result is None:
+        return None
+    if isinstance(result, str):
+        return _coerce_non_empty_trip_id(result)
+    if isinstance(result, dict):
+        for key in ("trip_id", "tripId"):
+            tid = _coerce_non_empty_trip_id(result.get(key))
+            if tid:
+                return tid
+        out = result.get("output")
+        if isinstance(out, dict):
+            for key in ("trip_id", "tripId"):
+                tid = _coerce_non_empty_trip_id(out.get(key))
+                if tid:
+                    return tid
+    return None
 
 
 def _default_task_state(session_id: str, items: dict[str, Any]) -> TaskState:
@@ -483,6 +668,173 @@ class WorkstreamRegistry(TaskStateStore):
         except Exception as e:
             _logger.warning("workstreams: write failed: %s", e)
 
+    def _read_focal(self) -> Optional[str]:
+        ws = self._ensure_active_workspace()
+        if not ws:
+            return None
+        raw = ws.get(WORKSPACE_TRIAGE_FOCAL_KEY)
+        if raw is None:
+            return None
+        s = str(raw).strip()
+        return s or None
+
+    def _write_focal(self, focal_id: str) -> None:
+        ws = self._ensure_active_workspace()
+        if not ws:
+            return
+        wid = ws.get("_id")
+        if not wid:
+            return
+        s = str(focal_id).strip()
+        if not s:
+            return
+        try:
+            res = self._ssc.update_workspace(
+                self._portfolio,
+                self._org,
+                self._entity_type,
+                self._entity_id,
+                self._thread_id,
+                str(wid),
+                {WORKSPACE_TRIAGE_FOCAL_KEY: s},
+            )
+            if not res.get("success"):
+                _logger.warning("workstreams: update_workspace focal: %s", res)
+                return
+            ws[WORKSPACE_TRIAGE_FOCAL_KEY] = s
+        except Exception as e:
+            _logger.warning("workstreams: focal write failed: %s", e)
+
+    def get_or_create_focal_workstream_id(self) -> str:
+        """Persisted triage focal ``reference_id`` (hex); created once per workspace row."""
+        existing = self._read_focal()
+        if existing:
+            return existing
+        nid = generate_triage_workstream_hex_id()
+        self._write_focal(nid)
+        return nid
+
+    def set_focal_workstream_id(self, reference_id: str) -> None:
+        """Point triage focal at an existing workstream (e.g. forced ``continue``)."""
+        s = str(reference_id).strip()
+        if s:
+            self._write_focal(s)
+
+    def bump_focal_workstream_id(self) -> str:
+        """Allocate a new focal id (parallel / ``new_intent`` path)."""
+        nid = generate_triage_workstream_hex_id()
+        self._write_focal(nid)
+        return nid
+
+    def after_forced_workstream_routing(self, routing: ForcedWorkstreamRouting) -> None:
+        """Sync focal from iteration-1 waiting-workstream routing before context build."""
+        if routing.tool_calls:
+            args = routing.tool_calls[0].arguments if isinstance(routing.tool_calls[0].arguments, dict) else {}
+            rid = args.get("reference_id")
+            if rid:
+                self.set_focal_workstream_id(str(rid).strip())
+        elif routing.bump_focal_workstream:
+            self.bump_focal_workstream_id()
+
+    def apply_triage_focal_reference_to_tool_calls(self, tool_calls: list[ToolCall]) -> None:
+        """
+        Normalize ``reference_id`` per tool call so parallel ``agent_quotes`` (e.g.
+        two new trips) get **distinct** server hex ids, while **waiting_for_user** rows and other
+        in-flight workstream keys are left as-is.
+
+        - Id matching a **waiting** workstream → keep (selector / model chose the right continuation).
+        - Id matching a non-completed row (e.g. ``error``) → keep.
+        - Id matching **completed** or unknown LLM label → new hex (fresh flow).
+        - **Omitted** id: if this batch has a single workstream tool call, use triage focal
+          (``get_or_create``); if **multiple** such calls, allocate a new hex per empty call so
+          trips do not collapse.
+        - Duplicate resolved ids within the same batch → second and later calls get fresh hexes.
+
+        Updates ``triage_focal_workstream_id`` on the workspace to the **last** resolved id in the
+        batch (hint for the next turn).
+        """
+        if not tool_calls or not self._ensure_active_workspace():
+            return
+
+        ws_calls: list[ToolCall] = []
+        for tc in tool_calls:
+            args = tc.arguments if isinstance(tc.arguments, dict) else None
+            if not args:
+                continue
+            name = (tc.tool_name or "").strip()
+            has_ref = "reference_id" in args
+            if name == "agent_quotes" or has_ref:
+                ws_calls.append(tc)
+
+        if not ws_calls:
+            return
+
+        items = self._read_items()
+        waiting_ids = _waiting_reference_ids_from_items(items)
+        by_fingerprint: dict[str, str] = {}
+        for rid, entry in items.items():
+            if not isinstance(entry, dict):
+                continue
+            st = str(entry.get("status") or "")
+            if st == "completed":
+                continue
+            fp = _workstream_intent_fingerprint_key(entry)
+            if fp and fp not in by_fingerprint:
+                by_fingerprint[fp] = str(rid)
+        n_ws = len(ws_calls)
+        assigned_in_batch: set[str] = set()
+        last_resolved: Optional[str] = None
+
+        for tc in ws_calls:
+            args = tc.arguments
+            if not isinstance(args, dict):
+                continue
+            raw = _tool_call_raw_reference_id(args)
+            fp = _intent_fingerprint_from_tool_args(args)
+            if fp:
+                args["intent_fingerprint"] = fp
+            resolved: Optional[str] = None
+
+            if raw in waiting_ids:
+                resolved = raw
+            elif raw:
+                entry = items.get(raw)
+                if isinstance(entry, dict):
+                    st = str(entry.get("status") or "")
+                    if st == "completed":
+                        resolved = None
+                    else:
+                        resolved = raw
+                else:
+                    resolved = None
+
+            if resolved is None and fp:
+                existing = by_fingerprint.get(fp)
+                if existing:
+                    resolved = existing
+
+            if resolved is None:
+                if not raw:
+                    resolved = (
+                        self.get_or_create_focal_workstream_id()
+                        if n_ws == 1
+                        else generate_triage_workstream_hex_id()
+                    )
+                else:
+                    resolved = generate_triage_workstream_hex_id()
+
+            while resolved in assigned_in_batch and not (fp and by_fingerprint.get(fp) == resolved):
+                resolved = generate_triage_workstream_hex_id()
+
+            assigned_in_batch.add(resolved)
+            if fp:
+                by_fingerprint[fp] = resolved
+            _set_tool_reference_arguments(args, resolved)
+            last_resolved = resolved
+
+        if last_resolved:
+            self.set_focal_workstream_id(last_resolved)
+
     def _save_task_state(self, session_id: str, ts: TaskState) -> None:
         if not self._ensure_active_workspace():
             _logger.warning("workstreams: skip save, no workspace for thread")
@@ -503,9 +855,12 @@ class WorkstreamRegistry(TaskStateStore):
         if not self._ensure_active_workspace():
             return None
         items = self._read_items()
-        if not items:
-            return _default_task_state(session_id, {})
-        return _default_task_state(session_id, items)
+        ts = _default_task_state(session_id, items if items else {})
+        focal = self.get_or_create_focal_workstream_id()
+        refs = dict(ts.references or {})
+        refs["triage_focal_workstream_id"] = focal
+        ts.references = refs
+        return ts
 
     def save_task_state(self, task_state: TaskState) -> None:
         self._save_task_state(task_state.session_id, task_state)
@@ -525,7 +880,13 @@ class WorkstreamRegistry(TaskStateStore):
         tool_calls: list[ToolCall],
         tool_results: list[ToolResult],
     ) -> None:
-        """Update workstream entries from tool calls (e.g. ``agent_quotes`` + ``reference_id``)."""
+        """
+        Update workstream entries from tool calls (e.g. ``agent_quotes`` + ``reference_id``).
+
+        When the tool's canonical ``output`` includes a ``trip_id`` (e.g. ``add_flight`` /
+        ``add_hotel`` / ``check_for_trip_id``), the entry stores ``trip_id`` so triage keeps a
+        durable pointer to the ``noma_travels`` document for this flow (``search_trips``, etc.).
+        """
         if len(tool_calls) != len(tool_results):
             return
         if not self._ensure_active_workspace():
@@ -536,7 +897,7 @@ class WorkstreamRegistry(TaskStateStore):
         for tc, tr in zip(tool_calls, tool_results):
             handler = (tc.tool_name or "").strip()
             args = tc.arguments if isinstance(tc.arguments, dict) else {}
-            ref = args.get("reference_id") or args.get("referenceId")
+            ref = args.get("reference_id")
             if ref is None or str(ref).strip() == "":
                 continue
             ref_s = str(ref).strip()
@@ -545,6 +906,9 @@ class WorkstreamRegistry(TaskStateStore):
             entry["reference_id"] = ref_s
             entry["tool"] = handler
             entry["handler"] = handler
+            fp = _intent_fingerprint_from_tool_args(args)
+            if fp:
+                entry["intent_fingerprint"] = fp
             if label is not None:
                 entry["label"] = str(label)
             entry["last_message_preview"] = _preview(args.get("message"), 400)
@@ -558,6 +922,26 @@ class WorkstreamRegistry(TaskStateStore):
             else:
                 entry["status"] = "error"
                 entry["last_error"] = str(tr.error or "")[:800]
+
+            proto = _extract_subagent_protocol(tr.result)
+            if isinstance(proto, dict):
+                entry["subagent_protocol"] = proto
+                upd = proto.get("update")
+                if isinstance(upd, dict):
+                    intention = upd.get("intention")
+                    state = upd.get("state")
+                    msg_for_user = upd.get("message_for_user")
+                    if intention:
+                        entry["intention"] = str(intention)
+                    if state:
+                        entry["subagent_state"] = str(state)
+                    if msg_for_user:
+                        entry["message_for_user"] = str(msg_for_user)
+
+            tid = _extract_trip_id_from_tool_result(tr.result)
+            if tid:
+                entry["trip_id"] = tid
+
             items[ref_s] = entry
 
         self._write_items(items)
@@ -589,24 +973,47 @@ class Workstreams(Context):
         if not task_state:
             return bundle
         refs = task_state.references or {}
+        focal = refs.get("triage_focal_workstream_id")
+        focal_s = str(focal).strip() if focal is not None else ""
         aw = refs.get("active_workstreams")
         po = refs.get("pending_obligations")
         if not isinstance(aw, dict):
             aw = {}
         if not isinstance(po, list):
             po = []
-        if not aw and not po:
+        if not aw and not po and not focal_s:
             return bundle
-        lines = [
-            "Active workstreams (multi-step flows). Pick which reference_id applies this turn; "
-            "call the listed handler/tool with that reference_id and the user's message.",
-            "If the user is continuing a flow that is waiting_for_user, prefer calling that handler "
-            "with the same reference_id and their latest message.",
-            "If the user is starting a separate or parallel task (unrelated question, new tool path), "
-            "call the appropriate handler with a new reference_id instead of reusing a waiting one.",
-            f"active_workstreams: {json.dumps(aw, default=str)[:12000]}",
-            f"pending_obligations: {json.dumps(po, default=str)[:8000]}",
-        ]
+        lines = []
+        if focal_s:
+            lines.extend(
+                [
+                    "Triage focal workstream: default hex reference_id for this thread. Before tools "
+                    "run, the runtime normalizes reference_id on agent_quotes (and other calls that "
+                    "already pass reference_id): waiting / in-flight ids are kept; completed or "
+                    "unknown labels get new hex ids; several agent_quotes in one turn each get "
+                    "distinct ids (omitted id on a lone call uses this focal). Intent fingerprint "
+                    "(``intent_fingerprint`` or hashed ``fingerprint_payload``) matches reuse the same "
+                    "in-flight stream instead of creating a duplicate. Focal "
+                    "is updated to the last resolved id after each tool batch.",
+                    f"triage_focal_workstream_id: {focal_s}",
+                ]
+            )
+        if aw or po:
+            lines.extend(
+                [
+                    "Active workstreams (multi-step flows). Pick which reference_id applies this turn; "
+                    "call the listed handler/tool with that reference_id and the user's message.",
+                    "If the user is continuing a flow that is waiting_for_user, prefer calling that handler "
+                    "with the same reference_id and their latest message.",
+                    "Do not split one trip intent into multiple workstreams. A single trip with flights, "
+                    "hotel, and return leg stays in one stream.",
+                    "Create multiple workstreams only when the user explicitly asks for multiple distinct trips.",
+                    "If the user is starting a separate or parallel task (unrelated question, new tool path), "
+                    "call the appropriate handler with a new reference_id instead of reusing a waiting one.",
+                    f"active_workstreams: {json.dumps(aw, default=str)[:12000]}",
+                    f"pending_obligations: {json.dumps(po, default=str)[:8000]}",
+                ]
+            )
         extra = PromptMessage(
             role="internal",
             content="\n".join(lines),

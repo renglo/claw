@@ -12,6 +12,7 @@ from .class_prototypes import (
     ContextBundle,
     IncomingEvent,
     LLMAdapter,
+    PromptMessage,
     ReactDecision,
     SessionEvent,
     TaskState,
@@ -23,9 +24,56 @@ from .class_prototypes import (
 )
 from .context import Context
 from .tools import Tools
-from .workstreams import forced_tool_calls_for_pending_workstream_reply
+from .workstreams import ForcedWorkstreamRouting, resolve_forced_workstream_routing
 
 _logger = logging.getLogger(__name__)
+
+
+def _extract_protocol_update(result: Any) -> dict[str, Any]:
+    if isinstance(result, dict):
+        proto = result.get("subagent_protocol")
+        if isinstance(proto, dict):
+            upd = proto.get("update")
+            return upd if isinstance(upd, dict) else {}
+        msgs = result.get("messages")
+        if isinstance(msgs, list):
+            for row in msgs:
+                if (
+                    isinstance(row, dict)
+                    and row.get("_interface") == "subagent_protocol"
+                    and isinstance((row.get("_out") or {}).get("content"), dict)
+                ):
+                    content = (row.get("_out") or {}).get("content") or {}
+                    upd = content.get("update")
+                    return upd if isinstance(upd, dict) else {}
+    if isinstance(result, list):
+        for row in result:
+            if (
+                isinstance(row, dict)
+                and row.get("_interface") == "subagent_protocol"
+                and isinstance((row.get("_out") or {}).get("content"), dict)
+            ):
+                content = (row.get("_out") or {}).get("content") or {}
+                upd = content.get("update")
+                return upd if isinstance(upd, dict) else {}
+    return {}
+
+
+def _collect_protocol_messages_for_user(tool_results: list[ToolResult]) -> str:
+    parts: list[str] = []
+    seen: set[str] = set()
+    for tr in tool_results:
+        if not tr.success:
+            continue
+        upd = _extract_protocol_update(tr.result)
+        m = str(upd.get("message_for_user") or "").strip()
+        if not m or m in seen:
+            continue
+        seen.add(m)
+        parts.append(m)
+    if not parts:
+        return ""
+    return "\n\n".join(parts)
 
 
 class Loop:
@@ -210,6 +258,28 @@ class Loop:
                 tool_names=[getattr(t, "tool_name", str(t)) for t in sel_tools],
             )
 
+            routing = ForcedWorkstreamRouting([])
+            if iteration == 1 and incoming_event.event_type == "user_message" and self._task_store:
+                routing = resolve_forced_workstream_routing(
+                    task_state, incoming_event, llm=self._llm
+                )
+                hook = getattr(self._task_store, "after_forced_workstream_routing", None)
+                if callable(hook):
+                    hook(routing)
+                task_state = self._task_store.get_task_state(session_id)
+            split_calls: list[ToolCall] = []
+            if (
+                iteration == 1
+                and not routing.tool_calls
+                and self._should_try_intent_splitter(incoming_event, task_state)
+            ):
+                user_text = str(
+                    (incoming_event.payload or {}).get("text")
+                    or (incoming_event.payload or {}).get("message")
+                    or ""
+                )
+                split_calls = self._tool_calls_from_intent_split(user_text)
+
             bundle = self._ctx.build_context(
                 incoming_event,
                 sel_events,
@@ -225,11 +295,9 @@ class Loop:
                 tools=len(bundle.tools),
             )
 
-            forced_tcs = forced_tool_calls_for_pending_workstream_reply(
-                task_state, incoming_event, llm=self._llm
-            )
-            if forced_tcs and iteration == 1:
-                tc0 = forced_tcs[0]
+            if (routing.tool_calls or split_calls) and iteration == 1:
+                forced_calls = routing.tool_calls or split_calls
+                tc0 = forced_calls[0]
                 self._debug_log(
                     "run_turn:forced_workstream_tool",
                     n=iteration,
@@ -238,7 +306,7 @@ class Loop:
                 )
                 decision = ReactDecision(
                     assistant_message=None,
-                    tool_calls=forced_tcs,
+                    tool_calls=forced_calls,
                     should_continue=True,
                 )
             else:
@@ -256,11 +324,44 @@ class Loop:
                 decision = self.interpret_model_output(raw)
 
             tool_results: list[ToolResult] = []
+            should_await_user = False
             if decision.tool_calls:
+                stamp = getattr(self._task_store, "apply_triage_focal_reference_to_tool_calls", None)
+                if callable(stamp):
+                    stamp(decision.tool_calls)
                 tool_results = self.execute_tool_calls(decision.tool_calls, tool_definitions=all_tools)
                 summary["tool_results"].extend([asdict(tr) for tr in tool_results])
+                for tr in tool_results:
+                    upd = _extract_protocol_update(tr.result)
+                    if str(upd.get("message_for_user") or "").strip():
+                        should_await_user = True
+            defer_assistant = False
+            relay_final = ""
+            if should_await_user:
+                decision.awaiting_user_input = True
+                relay = _collect_protocol_messages_for_user(tool_results)
+                if relay:
+                    pre = str(decision.assistant_message or "").strip()
+                    defer_assistant = True
+                    relay_final = relay
+                    decision.assistant_message = pre or None
 
-            self.persist_side_effects(session_id, decision, tool_results)
+            self.persist_side_effects(
+                session_id, decision, tool_results, defer_assistant_message=defer_assistant
+            )
+
+            if defer_assistant and relay_final:
+                decision.assistant_message = relay_final
+                now2 = datetime.utcnow()
+                relay_ev = SessionEvent(
+                    event_id=str(uuid.uuid4()),
+                    session_id=session_id,
+                    event_type="assistant_message",
+                    timestamp=now2,
+                    payload={"text": relay_final},
+                )
+                self.save_event(relay_ev)
+                self._emit_roll_ws(relay_ev)
 
             if decision.assistant_message:
                 last_assistant = decision.assistant_message
@@ -301,6 +402,101 @@ class Loop:
 
     def call_model(self, context: ContextBundle) -> dict[str, Any]:
         return self._llm.complete(context)
+
+    def _should_try_intent_splitter(self, incoming_event: IncomingEvent, task_state: Optional[TaskState]) -> bool:
+        if incoming_event.event_type != "user_message":
+            return False
+        refs = task_state.references if task_state else {}
+        aw = refs.get("active_workstreams") if isinstance(refs, dict) else None
+        if not isinstance(aw, dict):
+            return True
+        return not any(isinstance(v, dict) and v.get("status") == "waiting_for_user" for v in aw.values())
+
+    def _split_intents(self, user_text: str) -> dict[str, Any]:
+        system = (
+            "Classify whether the user message contains one intent or multiple distinct intents/tasks.\n"
+            "Return strict JSON with keys: mode, intent_requests, confidence.\n"
+            '- mode is "single" or "multi". Use "multi" only when the message clearly asks for 2+ separate requests.\n'
+            "intent_requests is an array. For each item include: intent_kind, intent_label, intent_message.\n"
+            "intent_kind is a short lowercase category (examples: travel_quote, weather_lookup, side_question, other).\n"
+            "intent_message must be a concise standalone user-style message for only that intent.\n"
+            "If uncertain, keep mode=single and return an empty intent_requests array."
+        )
+        bundle = ContextBundle(
+            messages=[
+                PromptMessage(role="system", content=system),
+                PromptMessage(role="user", content=user_text),
+            ],
+            tools=[],
+            response_format={"type": "json_object"},
+        )
+        raw = self.call_model(bundle)
+        msg = (raw.get("choices") or [{}])[0].get("message") or {}
+        content = str(msg.get("content") or "").strip()
+        if not content or content.startswith("LLM error:"):
+            return {"mode": "single", "intent_requests": [], "confidence": 0.0}
+        try:
+            data = json.loads(content)
+            if not isinstance(data, dict):
+                return {"mode": "single", "intent_requests": [], "confidence": 0.0}
+            intents = data.get("intent_requests")
+            if not isinstance(intents, list):
+                intents = []
+            clean_intents = [t for t in intents if isinstance(t, dict)]
+            mode = str(data.get("mode") or "single").strip().lower()
+            if mode not in ("single", "multi"):
+                mode = "single"
+            conf = data.get("confidence")
+            try:
+                confidence = float(conf)
+            except Exception:
+                confidence = 0.0
+            return {"mode": mode, "intent_requests": clean_intents, "confidence": confidence}
+        except Exception:
+            return {"mode": "single", "intent_requests": [], "confidence": 0.0}
+
+    def _tool_calls_from_intent_split(self, user_text: str) -> list[ToolCall]:
+        split = self._split_intents(user_text)
+        intents = split.get("intent_requests") or []
+        if split.get("mode") != "multi" or len(intents) < 2:
+            return []
+        calls: list[ToolCall] = []
+        for idx, intent in enumerate(intents):
+            if not isinstance(intent, dict):
+                continue
+            kind = str(intent.get("intent_kind") or "").strip().lower()
+            if kind != "travel_quote":
+                # Loop must stay tool-agnostic; only force known safe decomposition here.
+                return []
+            intent_msg = str(intent.get("intent_message") or "").strip()
+            msg = intent_msg or f"Please provide a travel quote for: {json.dumps(intent, default=str)}"
+            args: dict[str, Any] = {
+                "message": msg,
+                "fingerprint_schema": "travel_quote.v1",
+                "fingerprint_payload": {
+                    "intent_kind": kind,
+                    "intent_label": str(intent.get("intent_label") or "").strip(),
+                    "intent_message": intent_msg,
+                    "origin": str(intent.get("origin") or intent.get("from") or "").strip(),
+                    "destination": str(intent.get("destination") or intent.get("to") or "").strip(),
+                    "start_date": str(
+                        intent.get("start_date") or intent.get("departure_date") or ""
+                    ).strip(),
+                    "nights": str(intent.get("nights") or "").strip(),
+                    "adults": str(intent.get("adults") or "").strip(),
+                },
+            }
+            label = str(intent.get("intent_label") or "").strip()
+            if label:
+                args["label"] = label
+            calls.append(
+                ToolCall(
+                    tool_name="agent_quotes",
+                    arguments=args,
+                    call_id=f"forced-intent-split-{idx}-{uuid.uuid4()}",
+                )
+            )
+        return calls
 
     def interpret_model_output(self, model_output: dict[str, Any]) -> ReactDecision:
         if "choices" in model_output and model_output["choices"]:
@@ -450,9 +646,10 @@ class Loop:
         session_id: str,
         decision: ReactDecision,
         tool_results: list[ToolResult],
+        defer_assistant_message: bool = False,
     ) -> None:
         now = datetime.utcnow()
-        if decision.assistant_message:
+        if decision.assistant_message and not defer_assistant_message:
             asst_ev = SessionEvent(
                 event_id=str(uuid.uuid4()),
                 session_id=session_id,
