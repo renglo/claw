@@ -267,10 +267,15 @@ class ParallelAgent:
         )
 
         try:
+            inbound: Dict[str, Any] = {"message": context.message}
+            if context.connection_id:
+                # Triage UI stream: agent_quotes uses this to post specialist chain-of-thought
+                # to the same WebSocket (no entity_type / entity_id here—only the live connection).
+                inbound["connectionId"] = context.connection_id
             summary = gw.handle_incoming_message(
                 agent_name="parallel_agent",
                 channel="dosdos",
-                payload={"message": context.message},
+                payload=inbound,
                 account_id="trestres",
                 peer_id="cuatrocuatro",
                 thread_id=context.thread,

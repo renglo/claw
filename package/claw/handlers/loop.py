@@ -198,6 +198,14 @@ class Loop:
 
         had_turn = self._sessions.get_active_turn_id()
         self._debug_log("run_turn:before_create_turn", active_turn_id=had_turn)
+        turn_connection_id: Optional[str] = None
+        raw_cid = (incoming_event.payload or {}).get("connectionId")
+        if raw_cid is None:
+            raw_cid = (incoming_event.payload or {}).get("connection_id")
+        if raw_cid is not None:
+            s = str(raw_cid).strip()
+            if s:
+                turn_connection_id = s
         if not had_turn:
             ctx_payload = incoming_event.payload.get("context") or {"public_user": False}
             self._sessions.create_turn(ctx_payload)
@@ -329,7 +337,11 @@ class Loop:
                 stamp = getattr(self._task_store, "apply_triage_focal_reference_to_tool_calls", None)
                 if callable(stamp):
                     stamp(decision.tool_calls)
-                tool_results = self.execute_tool_calls(decision.tool_calls, tool_definitions=all_tools)
+                tool_results = self.execute_tool_calls(
+                    decision.tool_calls,
+                    tool_definitions=all_tools,
+                    connection_id=turn_connection_id,
+                )
                 summary["tool_results"].extend([asdict(tr) for tr in tool_results])
                 for tr in tool_results:
                     upd = _extract_protocol_update(tr.result)
@@ -558,6 +570,7 @@ class Loop:
         tool_calls: list[ToolCall],
         execution_mode: Literal["sequential", "parallel"] = "sequential",
         tool_definitions: list[ToolDefinition] | None = None,
+        connection_id: Optional[str] = None,
     ) -> list[ToolResult]:
         results: list[ToolResult] = []
         if execution_mode == "parallel":
@@ -600,6 +613,11 @@ class Loop:
                 init = {}
             params["_init"] = init
             params["_delegated"] = True
+            if (
+                connection_id
+                and tc.tool_name == "agent_quotes"
+            ):
+                params.setdefault("connectionId", connection_id)
 
             if self._schd and self._portfolio and self._org:
                 out = self._schd.handler_call(
