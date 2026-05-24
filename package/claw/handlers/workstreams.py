@@ -382,29 +382,55 @@ def _tool_result_requests_workstream_release(val: Any) -> bool:
     return False
 
 
-def _extract_subagent_protocol(result: Any) -> Optional[dict[str, Any]]:
-    if isinstance(result, dict):
-        proto = result.get("subagent_protocol")
-        if isinstance(proto, dict):
-            return proto
-        msgs = result.get("messages")
-        if isinstance(msgs, list):
-            for row in msgs:
-                if (
-                    isinstance(row, dict)
-                    and row.get("_interface") == "subagent_protocol"
-                    and isinstance((row.get("_out") or {}).get("content"), dict)
-                ):
-                    return (row.get("_out") or {}).get("content")
-    if isinstance(result, list):
-        for row in result:
-            if (
-                isinstance(row, dict)
-                and row.get("_interface") == "subagent_protocol"
-                and isinstance((row.get("_out") or {}).get("content"), dict)
-            ):
-                return (row.get("_out") or {}).get("content")
-    return None
+def _tool_result_contains_user_wait_marker(val: Any) -> bool:
+    if isinstance(val, dict):
+        status = str(val.get("status") or "").strip().lower()
+        if status == "awaiting":
+            return True
+        if bool(val.get("hook_interpret_skipped")):
+            return True
+        for v in val.values():
+            if _tool_result_contains_user_wait_marker(v):
+                return True
+        return False
+    if isinstance(val, list):
+        return any(_tool_result_contains_user_wait_marker(x) for x in val)
+    return False
+
+
+def _collect_next_continuity_ids(val: Any) -> list[str]:
+    ids: list[str] = []
+    if isinstance(val, dict):
+        for key in ("next", "_next"):
+            nxt = val.get(key)
+            if isinstance(nxt, str) and nxt.strip():
+                ids.append(nxt.strip())
+        for v in val.values():
+            ids.extend(_collect_next_continuity_ids(v))
+    elif isinstance(val, list):
+        for x in val:
+            ids.extend(_collect_next_continuity_ids(x))
+    return ids
+
+
+def _continuity_id_requires_user_reply(c_id: str) -> bool:
+    s = str(c_id or "").strip()
+    if not s:
+        return False
+    parts = s.split(":")
+    if len(parts) < 7:
+        return False
+    if parts[0] != "irn" or parts[1] != "c_id":
+        return False
+    tool_step = str(parts[5] or "").strip()
+    return tool_step in ("3", "5")
+
+
+def _tool_result_requests_user_followup(val: Any) -> bool:
+    if _tool_result_contains_user_wait_marker(val):
+        return True
+    ids = _collect_next_continuity_ids(val)
+    return any(_continuity_id_requires_user_reply(cid) for cid in ids)
 
 
 def _preview(val: Any, max_len: int) -> str:
@@ -915,28 +941,15 @@ class WorkstreamRegistry(TaskStateStore):
             if tr.success:
                 if _tool_result_requests_workstream_release(tr.result):
                     entry["status"] = "completed"
-                else:
+                elif _tool_result_requests_user_followup(tr.result):
                     entry["status"] = "waiting_for_user"
+                else:
+                    entry["status"] = "in_progress"
                 entry["last_result_preview"] = _preview(tr.result, 800)
                 entry["last_error"] = None
             else:
                 entry["status"] = "error"
                 entry["last_error"] = str(tr.error or "")[:800]
-
-            proto = _extract_subagent_protocol(tr.result)
-            if isinstance(proto, dict):
-                entry["subagent_protocol"] = proto
-                upd = proto.get("update")
-                if isinstance(upd, dict):
-                    intention = upd.get("intention")
-                    state = upd.get("state")
-                    msg_for_user = upd.get("message_for_user")
-                    if intention:
-                        entry["intention"] = str(intention)
-                    if state:
-                        entry["subagent_state"] = str(state)
-                    if msg_for_user:
-                        entry["message_for_user"] = str(msg_for_user)
 
             tid = _extract_trip_id_from_tool_result(tr.result)
             if tid:
@@ -999,6 +1012,16 @@ class Workstreams(Context):
                 ]
             )
         if aw or po:
+            compact_aw: dict[str, Any] = {}
+            for rid, entry in aw.items():
+                if not isinstance(entry, dict):
+                    continue
+                compact_aw[str(rid)] = {
+                    "reference_id": entry.get("reference_id") or rid,
+                    "tool": entry.get("tool"),
+                    "status": entry.get("status"),
+                    "last_message_preview": entry.get("last_message_preview"),
+                }
             lines.extend(
                 [
                     "Active workstreams (multi-step flows). Pick which reference_id applies this turn; "
@@ -1010,7 +1033,7 @@ class Workstreams(Context):
                     "Create multiple workstreams only when the user explicitly asks for multiple distinct trips.",
                     "If the user is starting a separate or parallel task (unrelated question, new tool path), "
                     "call the appropriate handler with a new reference_id instead of reusing a waiting one.",
-                    f"active_workstreams: {json.dumps(aw, default=str)[:12000]}",
+                    f"active_workstreams: {json.dumps(compact_aw, default=str)[:12000]}",
                     f"pending_obligations: {json.dumps(po, default=str)[:8000]}",
                 ]
             )

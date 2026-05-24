@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import hashlib
 import uuid
 from dataclasses import asdict
 from datetime import datetime
@@ -29,51 +30,57 @@ from .workstreams import ForcedWorkstreamRouting, resolve_forced_workstream_rout
 _logger = logging.getLogger(__name__)
 
 
-def _extract_protocol_update(result: Any) -> dict[str, Any]:
-    if isinstance(result, dict):
-        proto = result.get("subagent_protocol")
-        if isinstance(proto, dict):
-            upd = proto.get("update")
-            return upd if isinstance(upd, dict) else {}
-        msgs = result.get("messages")
-        if isinstance(msgs, list):
-            for row in msgs:
-                if (
-                    isinstance(row, dict)
-                    and row.get("_interface") == "subagent_protocol"
-                    and isinstance((row.get("_out") or {}).get("content"), dict)
-                ):
-                    content = (row.get("_out") or {}).get("content") or {}
-                    upd = content.get("update")
-                    return upd if isinstance(upd, dict) else {}
-    if isinstance(result, list):
-        for row in result:
-            if (
-                isinstance(row, dict)
-                and row.get("_interface") == "subagent_protocol"
-                and isinstance((row.get("_out") or {}).get("content"), dict)
-            ):
-                content = (row.get("_out") or {}).get("content") or {}
-                upd = content.get("update")
-                return upd if isinstance(upd, dict) else {}
-    return {}
-
-
-def _collect_protocol_messages_for_user(tool_results: list[ToolResult]) -> str:
-    parts: list[str] = []
-    seen: set[str] = set()
-    for tr in tool_results:
-        if not tr.success:
-            continue
-        upd = _extract_protocol_update(tr.result)
-        m = str(upd.get("message_for_user") or "").strip()
-        if not m or m in seen:
-            continue
-        seen.add(m)
-        parts.append(m)
-    if not parts:
+def _directive_text_from_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if content is None:
         return ""
-    return "\n\n".join(parts)
+    try:
+        return json.dumps(content, default=str).strip()
+    except Exception:
+        return str(content).strip()
+
+
+def _extract_system_directives_from_tool_result(result: Any) -> list[str]:
+    """Collect internal system directives embedded in tool result rows."""
+    found: list[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            row_type = str(node.get("_type") or "").strip().lower()
+            out = node.get("_out")
+            if isinstance(out, dict):
+                role = str(out.get("role") or "").strip().lower()
+                if row_type == "system" or role == "system":
+                    txt = _directive_text_from_content(out.get("content"))
+                    if txt:
+                        found.append(txt)
+            for v in node.values():
+                walk(v)
+            return
+        if isinstance(node, list):
+            for x in node:
+                walk(x)
+
+    walk(result)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in found:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def _directive_dedupe_key(
+    *,
+    tool_name: str,
+    call_id: Optional[str],
+    directive: str,
+) -> str:
+    basis = f"{tool_name}|{str(call_id or '').strip()}|{directive}"
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
 
 class Loop:
@@ -233,6 +240,8 @@ class Loop:
 
         iteration = 0
         last_assistant: str | None = None
+        pending_subagent_directives: list[str] = []
+        consumed_subagent_directives: set[str] = set()
         while iteration < self._max_iter:
             iteration += 1
             summary["iterations"] = iteration
@@ -251,7 +260,6 @@ class Loop:
 
             all_tools = self._load_tool_definitions(session_id, task_state)
             sel_tools = self._ctx.select_tools(incoming_event, task_state, all_tools)
-
             self._debug_log(
                 "run_turn:context_inputs",
                 n=iteration,
@@ -296,6 +304,30 @@ class Loop:
                 sel_journal,
                 sel_tools,
             )
+            if pending_subagent_directives:
+                injected_messages = list(bundle.messages)
+                insert_at = min(3, len(injected_messages))
+                for directive in pending_subagent_directives:
+                    injected_messages.insert(
+                        insert_at,
+                        PromptMessage(
+                            role="system",
+                            content=(
+                                "PRIORITY INTERNAL DIRECTIVE FROM SUBAGENT TOOL RESULT:\n"
+                                f"{directive}\n"
+                                "Treat this as an internal instruction for triage behavior in this turn."
+                            ),
+                            metadata={"layer": "subagent_system_directive"},
+                        ),
+                    )
+                    insert_at += 1
+                bundle = ContextBundle(
+                    messages=injected_messages,
+                    tools=bundle.tools,
+                    diagnostics=bundle.diagnostics,
+                    response_format=bundle.response_format,
+                )
+                pending_subagent_directives = []
             self._debug_log(
                 "run_turn:before_call_model",
                 n=iteration,
@@ -332,48 +364,51 @@ class Loop:
                 decision = self.interpret_model_output(raw)
 
             tool_results: list[ToolResult] = []
-            should_await_user = False
             if decision.tool_calls:
                 stamp = getattr(self._task_store, "apply_triage_focal_reference_to_tool_calls", None)
                 if callable(stamp):
                     stamp(decision.tool_calls)
-                tool_results = self.execute_tool_calls(
-                    decision.tool_calls,
-                    tool_definitions=all_tools,
-                    connection_id=turn_connection_id,
-                )
+                tool_results = []
+                for tc in decision.tool_calls:
+                    self._persist_tool_call_event(session_id, tc)
+                    batch = self.execute_tool_calls(
+                        [tc],
+                        tool_definitions=all_tools,
+                        connection_id=turn_connection_id,
+                    )
+                    tool_results.extend(batch)
+                    for tr in batch:
+                        self._persist_tool_result_event(session_id, tr)
                 summary["tool_results"].extend([asdict(tr) for tr in tool_results])
+                extracted: list[str] = []
+                skipped_duplicates = 0
                 for tr in tool_results:
-                    upd = _extract_protocol_update(tr.result)
-                    if str(upd.get("message_for_user") or "").strip():
-                        should_await_user = True
-            defer_assistant = False
-            relay_final = ""
-            if should_await_user:
-                decision.awaiting_user_input = True
-                relay = _collect_protocol_messages_for_user(tool_results)
-                if relay:
-                    pre = str(decision.assistant_message or "").strip()
-                    defer_assistant = True
-                    relay_final = relay
-                    decision.assistant_message = pre or None
-
-            self.persist_side_effects(
-                session_id, decision, tool_results, defer_assistant_message=defer_assistant
-            )
-
-            if defer_assistant and relay_final:
-                decision.assistant_message = relay_final
-                now2 = datetime.utcnow()
-                relay_ev = SessionEvent(
-                    event_id=str(uuid.uuid4()),
-                    session_id=session_id,
-                    event_type="assistant_message",
-                    timestamp=now2,
-                    payload={"text": relay_final},
-                )
-                self.save_event(relay_ev)
-                self._emit_roll_ws(relay_ev)
+                    for directive in _extract_system_directives_from_tool_result(tr.result):
+                        dedupe_key = _directive_dedupe_key(
+                            tool_name=str(tr.tool_name or "").strip(),
+                            call_id=tr.call_id,
+                            directive=directive,
+                        )
+                        if dedupe_key in consumed_subagent_directives:
+                            skipped_duplicates += 1
+                            continue
+                        consumed_subagent_directives.add(dedupe_key)
+                        if directive not in extracted:
+                            extracted.append(directive)
+                if extracted:
+                    pending_subagent_directives = extracted
+                    self._debug_log(
+                        "run_turn:captured_subagent_system_directives",
+                        n=iteration,
+                        directives=len(extracted),
+                    )
+                elif skipped_duplicates:
+                    self._debug_log(
+                        "run_turn:skipped_duplicate_subagent_system_directives",
+                        n=iteration,
+                        skipped=skipped_duplicates,
+                    )
+            self.persist_side_effects(session_id, decision, tool_results)
 
             if decision.assistant_message:
                 last_assistant = decision.assistant_message
@@ -659,15 +694,42 @@ class Loop:
             )
         return results
 
+    def _persist_tool_call_event(self, session_id: str, tc: ToolCall) -> None:
+        tc_ev = SessionEvent(
+            event_id=str(uuid.uuid4()),
+            session_id=session_id,
+            event_type="tool_call",
+            timestamp=datetime.utcnow(),
+            payload={"tool": tc.tool_name, "arguments": tc.arguments, "call_id": tc.call_id},
+        )
+        self.save_event(tc_ev)
+        self._emit_roll_ws(tc_ev)
+
+    def _persist_tool_result_event(self, session_id: str, tr: ToolResult) -> None:
+        tr_ev = SessionEvent(
+            event_id=str(uuid.uuid4()),
+            session_id=session_id,
+            event_type="tool_result",
+            timestamp=datetime.utcnow(),
+            payload={
+                "tool": tr.tool_name,
+                "call_id": tr.call_id,
+                "success": tr.success,
+                "result": tr.result,
+                "error": tr.error,
+            },
+        )
+        self.save_event(tr_ev)
+        self._emit_roll_ws(tr_ev)
+
     def persist_side_effects(
         self,
         session_id: str,
         decision: ReactDecision,
         tool_results: list[ToolResult],
-        defer_assistant_message: bool = False,
     ) -> None:
         now = datetime.utcnow()
-        if decision.assistant_message and not defer_assistant_message:
+        if decision.assistant_message:
             asst_ev = SessionEvent(
                 event_id=str(uuid.uuid4()),
                 session_id=session_id,
@@ -677,34 +739,6 @@ class Loop:
             )
             self.save_event(asst_ev)
             self._emit_roll_ws(asst_ev)
-
-        for tc in decision.tool_calls:
-            tc_ev = SessionEvent(
-                event_id=str(uuid.uuid4()),
-                session_id=session_id,
-                event_type="tool_call",
-                timestamp=now,
-                payload={"tool": tc.tool_name, "arguments": tc.arguments, "call_id": tc.call_id},
-            )
-            self.save_event(tc_ev)
-            self._emit_roll_ws(tc_ev)
-
-        for tr in tool_results:
-            tr_ev = SessionEvent(
-                event_id=str(uuid.uuid4()),
-                session_id=session_id,
-                event_type="tool_result",
-                timestamp=now,
-                payload={
-                    "tool": tr.tool_name,
-                    "call_id": tr.call_id,
-                    "success": tr.success,
-                    "result": tr.result,
-                    "error": tr.error,
-                },
-            )
-            self.save_event(tr_ev)
-            self._emit_roll_ws(tr_ev)
 
         for bw in decision.belief_writes:
             if self._beliefs:
