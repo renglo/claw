@@ -203,8 +203,6 @@ class Loop:
             "iterations": 0,
         }
 
-        had_turn = self._sessions.get_active_turn_id()
-        self._debug_log("run_turn:before_create_turn", active_turn_id=had_turn)
         turn_connection_id: Optional[str] = None
         raw_cid = (incoming_event.payload or {}).get("connectionId")
         if raw_cid is None:
@@ -213,15 +211,12 @@ class Loop:
             s = str(raw_cid).strip()
             if s:
                 turn_connection_id = s
-        if not had_turn:
-            ctx_payload = incoming_event.payload.get("context") or {"public_user": False}
-            self._sessions.create_turn(ctx_payload)
-            self._debug_log(
-                "run_turn:after_create_turn",
-                active_turn_id=self._sessions.get_active_turn_id(),
-            )
-        else:
-            self._debug_log("run_turn:skip_create_turn", active_turn_id=had_turn)
+        ctx_payload = incoming_event.payload.get("context") or {"public_user": False}
+        self._sessions.create_turn(ctx_payload)
+        self._debug_log(
+            "run_turn:after_create_turn",
+            active_turn_id=self._sessions.get_active_turn_id(),
+        )
 
         if incoming_event.event_type == "user_message":
             ut = incoming_event.payload.get("text") or incoming_event.payload.get("message") or ""

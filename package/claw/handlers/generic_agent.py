@@ -243,7 +243,6 @@ class GenericAgent:
             entity_type = context.entity_type,
             entity_id = context.entity_id,
             thread_id = context.thread,
-            data_controller = self.DAC,
         )
         self._sessions = ss
         

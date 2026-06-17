@@ -9,7 +9,7 @@ The implementation lives under `package/` as the installable Python module **`cl
 | Piece | Role |
 |--------|------|
 | **`Context`** | Builds `ContextBundle`: system layers (identity, policy, **current date/time**), beliefs, journal, session transcript, tools. Skips UI-only event types (`claw_stream`, `claw_signal`, `claw_subagent_message`) from the model prompt. |
-| **`Loop`** | Main react loop: create turn if needed, save inbound `user_message`, iterate LLM → `interpret_model_output` → tool execution → `persist_side_effects`, optional subagents, `print_chat` for stream rows, `on_roll_event` for live roll mirrors. |
+| **`Loop`** | Main react loop: create a new turn per inbound run, save inbound `user_message`, iterate LLM → `interpret_model_output` → tool execution → `persist_side_effects`, optional subagents, `print_chat` for stream rows, `on_roll_event` for live roll mirrors. |
 | **`Sessions`** | Binds `entity_type`, `entity_id`, `thread` into a session id; `create_turn` / `append_event` / `get_events`; maps `SessionEvent` ↔ turn row shape (`_type`, `_out`, `_meta`). |
 | **`Gateway`** | Routes inbound `user_message` (and internal signals) into `Loop.run_turn`. |
 | **`Tools`** | Loads `ToolDefinition` from **`schd_tools`** (via `DataController`); optional **shortlist** of tool keys, or ``[\"*\"]`` for all tools; supports **array** `input` (`[{name, hint, required}, …]`) and JSON Schema **object** `input`. |
@@ -54,7 +54,7 @@ The **`Tools`** class in `handlers/tools.py` normalizes `input` into OpenAI func
 
 ## Blueprints
 
-JSON blueprints under **`blueprints/`** are used with the installer / data layer (e.g. `claw_sessions`, `claw_beliefs`, `claw_journal`, `claw_compaction`). See **`installer/upload_blueprints.py`** for upload flow.
+JSON blueprints under **`blueprints/`** are used with the installer / data layer (e.g. `claw_beliefs`, `claw_journal`, `claw_compaction`). See **`installer/upload_blueprints.py`** for upload flow.
 
 ## Related code
 

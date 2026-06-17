@@ -37,9 +37,6 @@ def parse_session_key(session_id: str) -> tuple[str, str, str]:
     return parts[0], parts[1], parts[2]
 
 
-RING_SESSION_META = "claw_sessions"
-
-
 def _sanitize_for_dynamo(obj: Any) -> Any:
     """Recursively make values safe for DynamoDB (avoid raw floats; normalize nested data)."""
     if isinstance(obj, dict):
@@ -55,11 +52,13 @@ def _sanitize_for_dynamo(obj: Any) -> Any:
 
 class Sessions:
     """
-    Session ledger aligned with ``SessionController`` turns and optional
-    metadata in ``claw_session``.
+    Session ledger aligned with ``SessionController`` turns.
 
     Session id format: ``entity_type|entity_id|thread_id`` (``|`` must not
     appear inside components).
+
+    Each inbound ``Loop.run_turn`` creates a new turn document; ``_active_turn_id``
+    is scoped to the current handler invocation only.
 
     Turn ``events`` rows use:
     - ``_type``: ``event_type`` string (e.g. ``assistant_message``).
@@ -75,7 +74,6 @@ class Sessions:
         entity_type: str,
         entity_id: str,
         thread_id: str,
-        data_controller: Any | None = None,
     ) -> None:
         self._ssc = session_controller
         self._portfolio = portfolio
@@ -83,41 +81,8 @@ class Sessions:
         self._entity_type = entity_type
         self._entity_id = entity_id
         self._thread_id = thread_id
-        self._dc = data_controller
         self.session_id = format_session_key(entity_type, entity_id, thread_id)
         self._active_turn_id: str | None = None
-
-    def _meta_id(self) -> str:
-        return hashlib.sha256(self.session_id.encode("utf-8")).hexdigest()[:40]
-
-    def _load_meta_blob(self) -> dict[str, Any]:
-        if not self._dc:
-            return {}
-        doc = self._dc.get_a_b_c(self._portfolio, self._org, RING_SESSION_META, self._meta_id())
-        if doc.get("success") is False or "_id" not in doc:
-            return {}
-        return doc.get("metadata") or doc.get("meta") or {}
-
-    def _save_meta_blob(self, meta: dict[str, Any]) -> None:
-        if not self._dc:
-            return
-        mid = self._meta_id()
-        existing = self._dc.get_a_b_c(self._portfolio, self._org, RING_SESSION_META, mid)
-        payload = {"_id": mid, "session_id": self.session_id, "metadata": meta}
-        if existing.get("success") is False:
-            self._dc.post_a_b(self._portfolio, self._org, RING_SESSION_META, payload)
-        else:
-            self._dc.put_a_b_c(self._portfolio, self._org, RING_SESSION_META, mid, {"metadata": meta})
-
-    def create_session(
-        self,
-        session_id: str,
-        metadata: Optional[dict[str, Any]] = None,
-    ) -> None:
-        if session_id != self.session_id:
-            raise ValueError("session_id does not match bound Sessions key")
-        meta = metadata or {}
-        self._save_meta_blob(meta)
 
     def create_turn(self, context_payload: dict[str, Any], events: Optional[list] = None) -> str:
         """Creates a new turn document; returns ``turn_id`` (``_id``)."""
@@ -138,16 +103,10 @@ class Sessions:
         doc = res.get("document") or {}
         turn_id = str(doc.get("_id", ""))
         self._active_turn_id = turn_id
-        blob = self._load_meta_blob()
-        blob["active_turn_id"] = turn_id
-        self._save_meta_blob(blob)
         return turn_id
 
     def get_active_turn_id(self) -> Optional[str]:
-        if self._active_turn_id:
-            return self._active_turn_id
-        blob = self._load_meta_blob()
-        return blob.get("active_turn_id")
+        return self._active_turn_id
 
     def update_turn(self, turn_id: str, update: dict[str, Any], call_id: Any = False) -> dict[str, Any]:
         return self._ssc.update_turn(
@@ -381,18 +340,6 @@ class Sessions:
         if limit is not None:
             events = events[-limit:]
         return events
-
-    def get_session_metadata(self, session_id: str) -> dict[str, Any]:
-        if session_id != self.session_id:
-            raise ValueError("session_id mismatch")
-        return self._load_meta_blob()
-
-    def update_session_metadata(self, session_id: str, patch: dict[str, Any]) -> None:
-        if session_id != self.session_id:
-            raise ValueError("session_id mismatch")
-        cur = self._load_meta_blob()
-        cur.update(patch)
-        self._save_meta_blob(cur)
 
     @staticmethod
     def derive_session_id(
