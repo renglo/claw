@@ -10,6 +10,7 @@ setup(
     version="1.0.0",
     description="Claw extension — OpenClaw-style agent runtime handlers",
     author="NOMA Team",
+    license="MIT",
     packages=find_packages(),
     python_requires=">=3.12",
     install_requires=[
@@ -18,6 +19,7 @@ setup(
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
+        "License :: OSI Approved :: MIT License",
         "Programming Language :: Python :: 3.12",
     ],
 )

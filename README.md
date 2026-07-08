@@ -63,13 +63,13 @@ JSON blueprints under **`blueprints/`** are used with the installer / data layer
 
 ## License
 
-This extension is licensed under the **Server Side Public License v1** (SSPL-1.0). See **`LICENSE.txt`** in this directory (same terms as the PES extension).
+This extension is licensed under the **MIT License**. See **`LICENSE.txt`** in this directory.
 
 ## Package layout
 
 ```
 extensions/claw/
-├── LICENSE.txt               # SSPL-1.0
+├── LICENSE.txt               # MIT
 ├── README.md                 # this file
 ├── docs/
 │   ├── claw_specs.md         # design spec
