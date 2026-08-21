@@ -6,7 +6,7 @@ OpenClaw-style agent runtime handlers for the NOMA platform
 from setuptools import setup, find_packages
 
 setup(
-    name="claw-mod",
+    name="renglo-claw",
     version="1.0.0",
     description="Claw extension — OpenClaw-style agent runtime handlers",
     author="NOMA Team",

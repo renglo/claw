@@ -2,7 +2,7 @@
 
 CLAW is a **ReAct-style agent runtime** for Renglo: it assembles context from sessions, beliefs, journal, and tools; calls an LLM; executes tools via the scheduler; persists structured **session events**; and can stream status and roll-shaped messages to connected clients over WebSockets.
 
-The implementation lives under `package/` as the installable Python module **`claw-mod`**.
+The implementation lives under `package/` as the installable Python distribution **`renglo-claw`** (import package `claw`).
 
 ## What it provides
 
@@ -77,7 +77,7 @@ extensions/claw/
 ├── blueprints/               # ring blueprints
 ├── installer/
 └── package/
-    ├── pyproject.toml        # claw-mod
+    ├── pyproject.toml        # renglo-claw
     ├── requirements.txt
     └── claw/
         └── handlers/         # Context, Loop, Sessions, Tools, models, gateway, …
