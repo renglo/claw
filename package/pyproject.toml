@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "renglo-claw"
-version = "1.0.1rc1"
+version = "1.0.1"
 description = "Claw extension — OpenClaw-style agent runtime handlers"
 authors = [
     {name = "NOMA Team"}
