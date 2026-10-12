@@ -26,3 +26,6 @@ where = ["."]
 
 [tool.setuptools.package-data]
 "*" = ["blueprints/*.json"]
+
+[tool.renglo]
+platform = "0.1.6"
